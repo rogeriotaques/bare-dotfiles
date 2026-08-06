@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+# Define paths: bare git repo is hidden in ~/.dotfiles, work tree is $HOME
+GIT_DIR="$HOME/.dotfiles"
+WORK_TREE="$HOME"
+
+# Helper function to run Git inside the bare repository
+function git_config() {
+    /usr/bin/git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" "$@"
+}
+
+# Print clear usage guidelines
+function show_help() {
+    echo "Usage: dotfiles <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  init <remote_url>   Set up a bare repo at ~/.dotfiles and link a remote"
+    echo "  restore <remote>    Clone and deploy your dotfiles on a fresh machine (with auto-backup)"
+    echo "  add <files...>      Track files (e.g., dotfiles add .config/nvim/init.lua)"
+    echo "  save [msg]          Commit and push (auto-generates message if omitted)"
+    echo "  commit <msg>        Commit changes without pushing"
+    echo "  push                Push commits up to your remote repository"
+    echo "  list                List all tracked (backed up) files"
+    echo "  status              Check which tracked files have changed"
+    echo "  auto-sync           Check for changes and instantly commit/push (ideal for cron)"
+    echo "  git <args...>       Pass any raw Git command directly to the bare repo"
+}
+
+case "$1" in
+    init)
+        if [ -z "$2" ]; then
+            echo "Error: Remote repository URL required."
+            exit 1
+        fi
+        echo "Creating bare Git repository at $GIT_DIR..."
+        git init --bare "$GIT_DIR"
+        git_config config --local status.showUntrackedFiles no
+        git_config remote add origin "$2"
+        git_config branch -M main
+        echo "Initialization complete! Add files using: dotfiles add <file>"
+        ;;
+
+    restore)
+        if [ -z "$2" ]; then
+            echo "Error: Remote repository URL required to restore."
+            exit 1
+        fi
+
+        echo "Preparing to restore dotfiles from $2..."
+        echo ".dotfiles" >> "$HOME/.gitignore"
+
+        /usr/bin/git clone --bare "$2" "$GIT_DIR"
+        git_config config --local status.showUntrackedFiles no
+
+        echo "Checking for local file conflicts..."
+        CONFLICTS=$(git_config checkout 2>&1 | grep -E "^\s+" | awk '{print $1}')
+
+        if [ -n "$CONFLICTS" ]; then
+            BACKUP_DIR="$HOME/.dotfiles_backup_$(date +%Y%m%d_%H%M%S)"
+            echo "⚠️ Found pre-existing files that conflict with your backup."
+            echo "Moving conflicting files to safety at: $BACKUP_DIR"
+            mkdir -p "$BACKUP_DIR"
+
+            echo "$CONFLICTS" | while read -r FILE; do
+                if [ -f "$HOME/$FILE" ] || [ -L "$HOME/$FILE" ]; then
+                    mkdir -p "$BACKUP_DIR/$(dirname "$FILE")"
+                    mv "$HOME/$FILE" "$BACKUP_DIR/$FILE"
+                fi
+            done
+        fi
+
+        echo "Deploying files into place..."
+        git_config checkout -f
+        echo "🎉 Dotfiles successfully deployed perfectly to your home directory!"
+        ;;
+
+    auto-sync)
+        # Check if there are changes to already tracked files
+        # (Since status.showUntrackedFiles is 'no', this safely ignores untracked clutter)
+        if git_config diff --quiet --exit-code; then
+            echo "No changes detected in tracked dotfiles. Exiting cleanly."
+            exit 0
+        fi
+
+        echo "Changes detected! Preparing automated backup..."
+
+        # Stage all changes made to tracked files
+        git_config add -u
+
+        # Generate a distinct commit message indicating an automated run
+        HOSTNAME=$(hostname)
+        TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+        COMMIT_MSG="auto-sync: update from $HOSTNAME at $TIMESTAMP"
+
+        git_config commit -m "$COMMIT_MSG"
+
+        # Push to remote branch
+        CURRENT_BRANCH=$(git_config branch --show-current)
+        echo "Pushing changes to remote branch: $CURRENT_BRANCH..."
+        git_config push origin "$CURRENT_BRANCH"
+        echo "🎉 Auto-sync completed successfully!"
+        ;;
+
+    save)
+        shift
+        COMMIT_MSG="${1:-"dotfiles: update from $(hostname) at $(date '+%Y-%m-%d %H:%M:%S')"}"
+
+        git_config add -u
+        git_config commit -m "$COMMIT_MSG"
+
+        CURRENT_BRANCH=$(git_config branch --show-current)
+        git_config push origin "$CURRENT_BRANCH"
+        echo "Dotfiles saved and pushed to $CURRENT_BRANCH!"
+        ;;
+
+    list)
+        if ! git_config rev-parse HEAD > /dev/null 2>&1; then
+            echo "No files tracked yet. Use: dotfiles add <file>"
+            exit 0
+        fi
+        git_config ls-tree --name-only -r HEAD
+        ;;
+
+    add|commit|push|status)
+        git_config "$@"
+        ;;
+
+    git)
+        shift
+        git_config "$@"
+        ;;
+
+    *)
+        show_help
+        ;;
+esac
+
