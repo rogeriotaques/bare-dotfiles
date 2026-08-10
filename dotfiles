@@ -9,6 +9,64 @@ function git_config() {
     /usr/bin/git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" "$@"
 }
 
+# Render tracked files as an indented tree, collapsing busy directories
+function render_tree() {
+    local expand="$1" threshold="$2"
+    awk -v expand="$expand" -v threshold="$threshold" '
+    {
+        paths[NR] = $0
+        total = NR
+        n = split($0, parts, "/")
+        dir = ""
+        for (i = 1; i < n; i++) {
+            dir = (dir == "" ? parts[i] : dir "/" parts[i])
+            dir_count[dir]++
+        }
+    }
+    END {
+        for (i = 1; i <= total; i++) {
+            n = split(paths[i], parts, "/")
+
+            collapse_at = 0
+            dir = ""
+            for (j = 1; j < n; j++) {
+                dir = (dir == "" ? parts[j] : dir "/" parts[j])
+                if (expand != "true" && dir_count[dir] > threshold) {
+                    collapse_at = j
+                    break
+                }
+            }
+
+            if (collapse_at > 0) {
+                dir = ""
+                for (j = 1; j <= collapse_at; j++) {
+                    dir = (dir == "" ? parts[j] : dir "/" parts[j])
+                }
+                if (!(dir in shown)) {
+                    shown[dir] = 1
+                    indent = ""
+                    for (j = 1; j < collapse_at; j++) indent = indent "  "
+                    printf "%s%s/ (%d files)\n", indent, parts[collapse_at], dir_count[dir]
+                }
+            } else {
+                dir = ""
+                for (j = 1; j < n; j++) {
+                    dir = (dir == "" ? parts[j] : dir "/" parts[j])
+                    if (!(dir in shown)) {
+                        shown[dir] = 1
+                        indent = ""
+                        for (k = 1; k < j; k++) indent = indent "  "
+                        printf "%s%s/\n", indent, parts[j]
+                    }
+                }
+                indent = ""
+                for (j = 1; j < n; j++) indent = indent "  "
+                printf "%s%s\n", indent, parts[n]
+            }
+        }
+    }'
+}
+
 # Print clear usage guidelines
 function show_help() {
     echo "Usage: dotfiles <command> [options]"
@@ -20,7 +78,7 @@ function show_help() {
     echo "  save [msg]          Commit and push (auto-generates message if omitted)"
     echo "  commit <msg>        Commit changes without pushing"
     echo "  push                Push commits up to your remote repository"
-    echo "  list                List all tracked (backed up) files"
+    echo "  list [--all]        List all tracked (backed up) files (tree view; --all expands everything)"
     echo "  status              Check which tracked files have changed"
     echo "  auto-sync           Check for changes and instantly commit/push (ideal for cron)"
     echo "  git <args...>       Pass any raw Git command directly to the bare repo"
@@ -118,7 +176,11 @@ case "$1" in
             echo "No files tracked yet. Use: dotfiles add <file>"
             exit 0
         fi
-        git_config ls-tree --name-only -r HEAD
+
+        EXPAND_ALL=false
+        [ "${2:-}" = "--all" ] && EXPAND_ALL=true
+
+        /usr/bin/git -C "$WORK_TREE" --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" ls-tree --name-only -r HEAD | render_tree "$EXPAND_ALL" 5
         ;;
 
     add|commit|push|status)
