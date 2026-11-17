@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+VERSION="0.2.0"
+
 # Define paths: bare git repo is hidden in ~/.dotfiles, work tree is $HOME
 GIT_DIR="$HOME/.dotfiles"
 WORK_TREE="$HOME"
@@ -114,6 +116,7 @@ function show_help() {
     echo "  auto-sync           Check for changes and instantly commit/push (ideal for cron)"
     echo "  test-notify         Send a test failure notification to Slack"
     echo "  git <args...>       Pass any raw Git command directly to the bare repo"
+    echo "  version             Show the installed dotfiles version"
 }
 
 case "$1" in
@@ -252,6 +255,10 @@ case "$1" in
     git)
         shift
         git_config "$@"
+        ;;
+
+    version|--version|-v)
+        echo "dotfiles $VERSION"
         ;;
 
     *)

@@ -132,4 +132,5 @@ dotfiles test-notify
 | `dotfiles auto-sync` | Scans for file edits, snapshots, and updates your remote silently. Reports only on failure. |
 | `dotfiles test-notify` | Sends a test notification to the configured Slack webhook. |
 | `dotfiles git <args...>` | Runs standard git commands inside your bare setup context (e.g., `dotfiles git log`). |
+| `dotfiles version` | Prints the installed version (also `--version` / `-v`). |
 
