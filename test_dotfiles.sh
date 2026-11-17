@@ -117,6 +117,76 @@ echo "more changes" > "$FAKE_HOME/.testrc"
 STATUS_OUT=$(git_dotfiles status --short)
 assert_contains "status shows modification" "M" "$STATUS_OUT"
 
+# --- Helpers for running the real script against the fake home ---
+SCRIPT="$(cd "$(dirname "$0")" && pwd)/dotfiles"
+export GIT_AUTHOR_NAME="Test" GIT_AUTHOR_EMAIL="test@example.com"
+export GIT_COMMITTER_NAME="Test" GIT_COMMITTER_EMAIL="test@example.com"
+
+run_dotfiles() {
+    env -u ZDOTDIR -u XDG_STATE_HOME -u XDG_CONFIG_HOME -u DOTFILES_SLACK_WEBHOOK \
+        HOME="$FAKE_HOME" bash "$SCRIPT" "$@" < /dev/null
+}
+
+ERROR_FILE="$FAKE_HOME/.local/state/dotfiles/last-error"
+exists() { [ -e "$1" ] && echo true || echo false; }
+
+# --- Test: shell integration ---
+echo ""
+echo "[shell-integration]"
+printf 'export FOO=1' > "$FAKE_HOME/.zshrc"
+run_dotfiles shell-integration install zsh > /dev/null
+run_dotfiles shell-integration install zsh > /dev/null
+assert_eq "zsh block added once" "1" "$(grep -c '^# >>> dotfiles >>>$' "$FAKE_HOME/.zshrc")"
+assert_eq "existing zshrc content kept" "export FOO=1" "$(head -n 1 "$FAKE_HOME/.zshrc")"
+assert_eq "zshrc backed up" "export FOO=1" "$(cat "$FAKE_HOME/.zshrc.dotfiles-backup")"
+assert_contains "status reports installed" "installed" "$(run_dotfiles shell-integration status zsh)"
+
+run_dotfiles shell-integration install bash > /dev/null
+assert_eq "bash block added" "1" "$(grep -c '^# >>> dotfiles >>>$' "$FAKE_HOME/.bashrc")"
+
+run_dotfiles shell-integration install fish > /dev/null
+assert_eq "fish conf.d file created" "true" "$(exists "$FAKE_HOME/.config/fish/conf.d/dotfiles.fish")"
+run_dotfiles shell-integration uninstall fish > /dev/null
+assert_eq "fish conf.d file removed" "false" "$(exists "$FAKE_HOME/.config/fish/conf.d/dotfiles.fish")"
+
+# --- Test: auto-sync failure reporting ---
+echo ""
+echo "[auto-sync failure]"
+git_dotfiles add "$FAKE_HOME/.zshrc"
+git_dotfiles commit -m "track zshrc" > /dev/null 2>&1
+git_dotfiles push origin "$CURRENT_BRANCH" > /dev/null 2>&1
+git_dotfiles remote set-url origin "$TEST_DIR/missing.git"
+echo "export BAR=2" >> "$FAKE_HOME/.zshrc"
+
+run_dotfiles auto-sync > /dev/null 2>&1
+assert_eq "auto-sync exits non-zero on push failure" "1" "$?"
+assert_eq "error file written" "true" "$(exists "$ERROR_FILE")"
+assert_contains "error mentions the failed step" "git push" "$(cat "$ERROR_FILE")"
+assert_contains "status shows the failure" "last auto-sync failed" "$(run_dotfiles status)"
+
+if command -v zsh > /dev/null; then
+    SHELL_OUT=$(env -u XDG_STATE_HOME HOME="$FAKE_HOME" ZDOTDIR="$FAKE_HOME" zsh -i -c 'exit' 2>&1)
+    assert_contains "zsh startup shows the warning" "auto-sync failed" "$SHELL_OUT"
+fi
+
+# --- Test: auto-sync recovery ---
+echo ""
+echo "[auto-sync recovery]"
+git_dotfiles remote set-url origin "$REMOTE_DIR"
+run_dotfiles auto-sync > /dev/null 2>&1
+assert_eq "auto-sync succeeds once remote is back" "0" "$?"
+assert_eq "pending commit pushed" "$(git_dotfiles rev-parse HEAD)" "$(/usr/bin/git --git-dir="$REMOTE_DIR" rev-parse "$CURRENT_BRANCH")"
+assert_eq "error file cleared" "false" "$(exists "$ERROR_FILE")"
+assert_eq "silent when nothing to do" "" "$(run_dotfiles auto-sync 2>&1)"
+
+if command -v zsh > /dev/null; then
+    SHELL_OUT=$(env -u XDG_STATE_HOME HOME="$FAKE_HOME" ZDOTDIR="$FAKE_HOME" zsh -i -c 'exit' 2>&1)
+    assert_eq "zsh startup is quiet without errors" "" "$SHELL_OUT"
+fi
+
+run_dotfiles shell-integration uninstall zsh > /dev/null
+assert_eq "zsh block removed" "0" "$(grep -c 'dotfiles >>>' "$FAKE_HOME/.zshrc")"
+
 # --- Summary ---
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 
 # Define paths: bare git repo is hidden in ~/.dotfiles, work tree is $HOME
 GIT_DIR="$HOME/.dotfiles"
@@ -40,6 +40,169 @@ function notify_slack() {
     status=$(/usr/bin/curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
         -H 'Content-Type: application/json' -d "$payload" "$url" 2> /dev/null)
     [[ "$status" == 2* ]]
+}
+
+# Failure state, surfaced on shell start (via shell integration) and by `dotfiles status`
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles"
+ERROR_FILE="$STATE_DIR/last-error"
+ERROR_LOG="$STATE_DIR/last-error.log"
+
+function clear_error() {
+    rm -f "$ERROR_FILE" "$ERROR_LOG"
+}
+
+# Shell integration: a small, marked block in the shell's startup file that
+# prints the failure warning (if any) when a new interactive shell starts
+MARK_BEGIN="# >>> dotfiles >>>"
+MARK_END="# <<< dotfiles <<<"
+
+function detect_shell() {
+    basename "${SHELL:-}"
+}
+
+function shell_rc_file() {
+    case "$1" in
+        zsh)  echo "${ZDOTDIR:-$HOME}/.zshrc" ;;
+        bash) echo "$HOME/.bashrc" ;;
+        fish) echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/dotfiles.fish" ;;
+        *)    return 1 ;;
+    esac
+}
+
+function shell_snippet() {
+    echo "$MARK_BEGIN"
+    if [ "$1" = "fish" ]; then
+        cat <<'EOF'
+if status is-interactive
+    set -q XDG_STATE_HOME; and set -l state $XDG_STATE_HOME; or set -l state ~/.local/state
+    cat $state/dotfiles/last-error 2>/dev/null
+end
+EOF
+    else
+        # shellcheck disable=SC2016
+        echo '[[ $- == *i* ]] && cat "${XDG_STATE_HOME:-$HOME/.local/state}/dotfiles/last-error" 2>/dev/null || true'
+    fi
+    echo "$MARK_END"
+}
+
+# Print the integration block currently present in a file (empty if none)
+function shell_block() {
+    [ -f "$1" ] || return 0
+    awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0 == b { p = 1 } p { print } $0 == e { p = 0 }' "$1"
+}
+
+# Write content to a file in place, so symlinked startup files stay symlinks
+function write_in_place() {
+    local file="$1" tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/dotfiles-rc.XXXXXX")
+    cat > "$tmp"
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+}
+
+function shell_integration_install() {
+    local shell="$1" rc
+    if ! rc=$(shell_rc_file "$shell"); then
+        echo "Unsupported shell: ${shell:-unknown}. Supported shells: zsh, bash, fish."
+        return 1
+    fi
+
+    if [ "$(shell_block "$rc")" = "$(shell_snippet "$shell")" ]; then
+        echo "Shell integration is already up to date in $rc"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$rc")"
+    if [ -n "$(shell_block "$rc")" ]; then
+        SNIPPET="$(shell_snippet "$shell")" awk -v b="$MARK_BEGIN" -v e="$MARK_END" '
+            $0 == b { print ENVIRON["SNIPPET"]; skip = 1; next }
+            skip && $0 == e { skip = 0; next }
+            !skip' "$rc" | write_in_place "$rc"
+        echo "Updated shell integration in $rc"
+    else
+        if [ -s "$rc" ]; then
+            [ -e "$rc.dotfiles-backup" ] || cp "$rc" "$rc.dotfiles-backup"
+            [ -n "$(tail -c 1 "$rc")" ] && echo >> "$rc"
+            echo >> "$rc"
+        fi
+        shell_snippet "$shell" >> "$rc"
+        echo "Added shell integration to $rc"
+    fi
+
+    # macOS terminals start bash as a login shell, which skips ~/.bashrc unless ~/.bash_profile loads it
+    if [ "$shell" = "bash" ] && [ "$(uname -s)" = "Darwin" ] && ! grep -qs "bashrc" "$HOME/.bash_profile"; then
+        echo "Note: make sure ~/.bash_profile sources ~/.bashrc, or the warning won't show in new terminals."
+    fi
+}
+
+function shell_integration_uninstall() {
+    local shell="$1" rc
+    if ! rc=$(shell_rc_file "$shell"); then
+        echo "Unsupported shell: ${shell:-unknown}. Supported shells: zsh, bash, fish."
+        return 1
+    fi
+
+    if [ -z "$(shell_block "$rc")" ]; then
+        echo "No shell integration found in $rc"
+        return 0
+    fi
+
+    if [ "$shell" = "fish" ]; then
+        rm -f "$rc"
+    else
+        awk -v b="$MARK_BEGIN" -v e="$MARK_END" '$0 == b { skip = 1; next } skip && $0 == e { skip = 0; next } !skip' "$rc" \
+            | write_in_place "$rc"
+    fi
+    echo "Removed shell integration from $rc"
+}
+
+function shell_integration_status() {
+    local shell="$1" rc block
+    if ! rc=$(shell_rc_file "$shell"); then
+        echo "Unsupported shell: ${shell:-unknown}. Supported shells: zsh, bash, fish."
+        return 1
+    fi
+
+    block=$(shell_block "$rc")
+    if [ -z "$block" ]; then
+        echo "$shell: not installed ($rc). Run: dotfiles shell-integration install"
+        return 1
+    elif [ "$block" = "$(shell_snippet "$shell")" ]; then
+        echo "$shell: installed in $rc"
+    else
+        echo "$shell: outdated in $rc. Run: dotfiles shell-integration install"
+        return 1
+    fi
+}
+
+# Called by init/restore: offer to install the integration for the user's login shell
+function offer_shell_integration() {
+    local arg shell rc reply
+    for arg in "$@"; do
+        [ "$arg" = "--no-shell-integration" ] && return 0
+    done
+
+    shell=$(detect_shell)
+    if ! rc=$(shell_rc_file "$shell"); then
+        echo "Shell integration: '${shell:-unknown}' is not supported (zsh, bash, fish). Skipping."
+        return 0
+    fi
+
+    if [ "$(shell_block "$rc")" = "$(shell_snippet "$shell")" ]; then
+        echo "Shell integration is already set up in $rc"
+        return 0
+    fi
+
+    if [ ! -t 0 ]; then
+        echo "Skipping shell integration (non-interactive). Enable it with: dotfiles shell-integration install"
+        return 0
+    fi
+
+    read -r -p "Warn on terminal startup when auto-sync fails? Adds a small block to $rc [Y/n] " reply
+    case "$reply" in
+        [nN]*) echo "Skipped. Enable it anytime with: dotfiles shell-integration install" ;;
+        *)     shell_integration_install "$shell" ;;
+    esac
 }
 
 # Render tracked files as an indented tree, collapsing busy directories
@@ -107,13 +270,16 @@ function show_help() {
     echo "Commands:"
     echo "  init <remote_url>   Set up a bare repo at ~/.dotfiles and link a remote"
     echo "  restore <remote>    Clone and deploy your dotfiles on a fresh machine (with auto-backup)"
+    echo "                      (init/restore offer shell integration; skip with --no-shell-integration)"
     echo "  add <files...>      Track files (e.g., dotfiles add .config/nvim/init.lua)"
     echo "  save [msg]          Commit and push (auto-generates message if omitted)"
     echo "  commit <msg>        Commit changes without pushing"
     echo "  push                Push commits up to your remote repository"
     echo "  list [--all]        List all tracked (backed up) files (tree view; --all expands everything)"
-    echo "  status              Check which tracked files have changed"
+    echo "  status              Show the last auto-sync failure (if any) and which tracked files changed"
     echo "  auto-sync           Check for changes and instantly commit/push (ideal for cron)"
+    echo "  shell-integration [install|uninstall|status] [zsh|bash|fish]"
+    echo "                      Warn on terminal startup when auto-sync fails (defaults: status, \$SHELL)"
     echo "  test-notify         Send a test failure notification to Slack"
     echo "  git <args...>       Pass any raw Git command directly to the bare repo"
     echo "  version             Show the installed dotfiles version"
@@ -131,6 +297,7 @@ case "$1" in
         git_config remote add origin "$2"
         git_config branch -M main
         echo "Initialization complete! Add files using: dotfiles add <file>"
+        offer_shell_integration "$@"
         ;;
 
     restore)
@@ -165,6 +332,7 @@ case "$1" in
         echo "Deploying files into place..."
         git_config checkout -f
         echo "🎉 Dotfiles successfully deployed perfectly to your home directory!"
+        offer_shell_integration "$@"
         ;;
 
     auto-sync)
@@ -174,18 +342,25 @@ case "$1" in
 
         HOSTNAME=$(hostname)
         TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
-        LOG=$(mktemp -t dotfiles-auto-sync)
+        LOG=$(mktemp "${TMPDIR:-/tmp}/dotfiles-auto-sync.XXXXXX")
         trap 'rm -f "$LOG"' EXIT
 
-        # Report via Slack; fall back to stderr (cron's local mail) if Slack is unavailable
+        # Record the failure (shown on shell start and by `dotfiles status`), then report
+        # via Slack, falling back to stderr (cron's local mail) if Slack is unavailable
         function fail() {
             local summary="dotfiles auto-sync failed on $HOSTNAME at $TIMESTAMP: $1"
             local details
             details=$(tail -n 40 "$LOG")
-            if ! notify_slack ":warning: *${summary}*"$'\n```\n'"${details}"$'\n```'; then
+
+            mkdir -p "$STATE_DIR"
+            echo "⚠️  dotfiles: auto-sync failed at $TIMESTAMP ($1). Run 'dotfiles status' for details." > "$ERROR_FILE"
+            { echo "$summary"; echo ""; cat "$LOG"; } > "$ERROR_LOG"
+
+            if notify_slack ":warning: *${summary}*"$'\n```\n'"${details}"$'\n```'; then
+                [ -t 1 ] && echo "$summary"
+            else
                 { echo "$summary"; echo ""; echo "$details"; } >&2
             fi
-            [ -t 1 ] && echo "$summary"
             exit 1
         }
 
@@ -193,21 +368,38 @@ case "$1" in
         # (Since status.showUntrackedFiles is 'no', this safely ignores untracked clutter)
         git_config diff --quiet --exit-code > "$LOG" 2>&1
         case $? in
-            0) say "No changes detected in tracked dotfiles. Exiting cleanly."; exit 0 ;;
-            1) ;;
+            0) HAS_CHANGES=false ;;
+            1) HAS_CHANGES=true ;;
             *) fail "could not check for changes" ;;
         esac
 
-        say "Changes detected! Preparing automated backup..."
-
-        COMMIT_MSG="auto-sync: update from $HOSTNAME at $TIMESTAMP"
-
-        git_config add -u > "$LOG" 2>&1 || fail "git add failed"
-        git_config commit -m "$COMMIT_MSG" > "$LOG" 2>&1 || fail "git commit failed"
-
         CURRENT_BRANCH=$(git_config branch --show-current)
+        TRACKING_REF="refs/remotes/origin/$CURRENT_BRANCH"
+
+        if [ "$HAS_CHANGES" = true ]; then
+            say "Changes detected! Preparing automated backup..."
+            COMMIT_MSG="auto-sync: update from $HOSTNAME at $TIMESTAMP"
+            git_config add -u > "$LOG" 2>&1 || fail "git add failed"
+            git_config commit -m "$COMMIT_MSG" > "$LOG" 2>&1 || fail "git commit failed"
+        elif ! git_config rev-parse --verify -q HEAD > /dev/null; then
+            say "Nothing tracked yet. Exiting cleanly."
+            clear_error
+            exit 0
+        elif git_config rev-parse --verify -q "$TRACKING_REF" > /dev/null \
+            && [ -z "$(git_config rev-list "$TRACKING_REF..HEAD")" ]; then
+            say "No changes detected in tracked dotfiles. Exiting cleanly."
+            clear_error
+            exit 0
+        else
+            # e.g., a previous push failed: retry pushing the pending commits
+            say "No new changes, but there are commits that haven't been pushed yet."
+        fi
+
         say "Pushing changes to remote branch: $CURRENT_BRANCH..."
         git_config push origin "$CURRENT_BRANCH" > "$LOG" 2>&1 || fail "git push to $CURRENT_BRANCH failed"
+        # Keep the remote-tracking ref current so later runs can detect unpushed commits
+        git_config update-ref "$TRACKING_REF" HEAD
+        clear_error
         say "🎉 Auto-sync completed successfully!"
         ;;
 
@@ -219,7 +411,9 @@ case "$1" in
         git_config commit -m "$COMMIT_MSG"
 
         CURRENT_BRANCH=$(git_config branch --show-current)
-        git_config push origin "$CURRENT_BRANCH"
+        git_config push origin "$CURRENT_BRANCH" || exit 1
+        git_config update-ref "refs/remotes/origin/$CURRENT_BRANCH" HEAD
+        clear_error
         echo "Dotfiles saved and pushed to $CURRENT_BRANCH!"
         ;;
 
@@ -248,7 +442,33 @@ case "$1" in
         fi
         ;;
 
-    add|commit|push|status)
+    shell-integration)
+        TARGET_SHELL="${3:-$(detect_shell)}"
+        case "${2:-status}" in
+            install)   shell_integration_install "$TARGET_SHELL" ;;
+            uninstall) shell_integration_uninstall "$TARGET_SHELL" ;;
+            status)    shell_integration_status "$TARGET_SHELL" ;;
+            *)
+                echo "Usage: dotfiles shell-integration [install|uninstall|status] [zsh|bash|fish]"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    status)
+        if [ -f "$ERROR_FILE" ]; then
+            echo "⚠️  The last auto-sync failed. It will be retried on the next run."
+            echo ""
+            [ -f "$ERROR_LOG" ] && cat "$ERROR_LOG" && echo ""
+        fi
+        git_config "$@"
+        ;;
+
+    push)
+        git_config "$@" && clear_error
+        ;;
+
+    add|commit)
         git_config "$@"
         ;;
 
