@@ -9,6 +9,37 @@ function git_config() {
     /usr/bin/git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" "$@"
 }
 
+# Slack incoming webhook URL, read from env or a private (untracked) file
+SLACK_WEBHOOK_FILE="$HOME/.config/dotfiles/slack-webhook-url"
+function slack_webhook_url() {
+    if [ -n "$DOTFILES_SLACK_WEBHOOK" ]; then
+        echo "$DOTFILES_SLACK_WEBHOOK"
+    elif [ -r "$SLACK_WEBHOOK_FILE" ]; then
+        head -n 1 "$SLACK_WEBHOOK_FILE" | tr -d '[:space:]'
+    fi
+}
+
+function json_escape() {
+    awk 'BEGIN { ORS = "" }
+    {
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/\t/, "\\t"); gsub(/\r/, "")
+        gsub(/[\001-\037]/, "")
+        if (NR > 1) printf "\\n"
+        print
+    }'
+}
+
+# Post a message to Slack. Returns non-zero if no webhook is set or delivery fails.
+function notify_slack() {
+    local url payload status
+    url=$(slack_webhook_url)
+    [ -z "$url" ] && return 1
+    payload="{\"text\":\"$(printf '%s' "$1" | json_escape)\"}"
+    status=$(/usr/bin/curl -sS --max-time 15 -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/json' -d "$payload" "$url" 2> /dev/null)
+    [[ "$status" == 2* ]]
+}
+
 # Render tracked files as an indented tree, collapsing busy directories
 function render_tree() {
     local expand="$1" threshold="$2"
@@ -81,6 +112,7 @@ function show_help() {
     echo "  list [--all]        List all tracked (backed up) files (tree view; --all expands everything)"
     echo "  status              Check which tracked files have changed"
     echo "  auto-sync           Check for changes and instantly commit/push (ideal for cron)"
+    echo "  test-notify         Send a test failure notification to Slack"
     echo "  git <args...>       Pass any raw Git command directly to the bare repo"
 }
 
@@ -133,30 +165,47 @@ case "$1" in
         ;;
 
     auto-sync)
-        # Check if there are changes to already tracked files
-        # (Since status.showUntrackedFiles is 'no', this safely ignores untracked clutter)
-        if git_config diff --quiet --exit-code; then
-            echo "No changes detected in tracked dotfiles. Exiting cleanly."
-            exit 0
-        fi
+        # Silent on success, so cron only sends mail when something fails.
+        # Progress messages are shown only when run interactively.
+        function say() { [ -t 1 ] && echo "$@"; return 0; }
 
-        echo "Changes detected! Preparing automated backup..."
-
-        # Stage all changes made to tracked files
-        git_config add -u
-
-        # Generate a distinct commit message indicating an automated run
         HOSTNAME=$(hostname)
         TIMESTAMP=$(date "+%Y-%m-%d %H:%M:%S")
+        LOG=$(mktemp -t dotfiles-auto-sync)
+        trap 'rm -f "$LOG"' EXIT
+
+        # Report via Slack; fall back to stderr (cron's local mail) if Slack is unavailable
+        function fail() {
+            local summary="dotfiles auto-sync failed on $HOSTNAME at $TIMESTAMP: $1"
+            local details
+            details=$(tail -n 40 "$LOG")
+            if ! notify_slack ":warning: *${summary}*"$'\n```\n'"${details}"$'\n```'; then
+                { echo "$summary"; echo ""; echo "$details"; } >&2
+            fi
+            [ -t 1 ] && echo "$summary"
+            exit 1
+        }
+
+        # Check if there are changes to already tracked files
+        # (Since status.showUntrackedFiles is 'no', this safely ignores untracked clutter)
+        git_config diff --quiet --exit-code > "$LOG" 2>&1
+        case $? in
+            0) say "No changes detected in tracked dotfiles. Exiting cleanly."; exit 0 ;;
+            1) ;;
+            *) fail "could not check for changes" ;;
+        esac
+
+        say "Changes detected! Preparing automated backup..."
+
         COMMIT_MSG="auto-sync: update from $HOSTNAME at $TIMESTAMP"
 
-        git_config commit -m "$COMMIT_MSG"
+        git_config add -u > "$LOG" 2>&1 || fail "git add failed"
+        git_config commit -m "$COMMIT_MSG" > "$LOG" 2>&1 || fail "git commit failed"
 
-        # Push to remote branch
         CURRENT_BRANCH=$(git_config branch --show-current)
-        echo "Pushing changes to remote branch: $CURRENT_BRANCH..."
-        git_config push origin "$CURRENT_BRANCH"
-        echo "🎉 Auto-sync completed successfully!"
+        say "Pushing changes to remote branch: $CURRENT_BRANCH..."
+        git_config push origin "$CURRENT_BRANCH" > "$LOG" 2>&1 || fail "git push to $CURRENT_BRANCH failed"
+        say "🎉 Auto-sync completed successfully!"
         ;;
 
     save)
@@ -181,6 +230,19 @@ case "$1" in
         [ "${2:-}" = "--all" ] && EXPAND_ALL=true
 
         /usr/bin/git -C "$WORK_TREE" --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" ls-tree --name-only -r HEAD | render_tree "$EXPAND_ALL" 5
+        ;;
+
+    test-notify)
+        if [ -z "$(slack_webhook_url)" ]; then
+            echo "No Slack webhook configured. Save its URL to $SLACK_WEBHOOK_FILE"
+            exit 1
+        fi
+        if notify_slack ":white_check_mark: dotfiles test notification from $(hostname)"; then
+            echo "Test notification sent to Slack."
+        else
+            echo "Failed to deliver the Slack notification. Check the webhook URL."
+            exit 1
+        fi
         ;;
 
     add|commit|push|status)

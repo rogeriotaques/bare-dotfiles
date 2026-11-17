@@ -19,6 +19,7 @@ Because this tool is designed to run non-interactively on fresh installations an
 - **Automatic Placement:** Deploys tracked files precisely to their proper target destinations (~/.bashrc, ~/.config/nvim/, etc.) instantly.
 - **Conflict Safeguards:** Automatically detects pre-existing system configuration files and moves them out of the way into a timestamped backup folder before completing setups.
 - **Built-in Automation:** Includes an auto-sync command designed for background cron jobs to seamlessly commit and push local changes if modifications are detected.
+- **Failure-Only Notifications:** Auto-sync stays silent on success and alerts you only when something goes wrong, via Slack or cron's local mail.
 
 ---
 
@@ -67,6 +68,8 @@ dotfiles restore git@github.com:yourusername/dotfiles.git
 
 The CLI features an `auto-sync` function that checks tracked files for modifications. If changes are detected, it builds an automated commit and pushes it silently to your remote server.
 
+When run non-interactively (e.g., from cron), `auto-sync` produces **no output on success**. If any step fails (checking for changes, staging, committing, or pushing), it reports which step failed along with Git's output and exits with a non-zero status. Progress messages are still shown when you run it from a terminal.
+
 ### Setting up Cron Automation
 To run checks in the background automatically (e.g., daily at midnight), edit your system crontab:
 
@@ -77,10 +80,40 @@ crontab -e
 Append the following line (replace `yourusername` with your actual system username):
 
 ```cron
+0 0 * * * /home/yourusername/.local/bin/dotfiles auto-sync > /dev/null
+```
+
+Cron emails any output a job produces to your local mailbox. Since `auto-sync` is silent on success, you'll only receive mail when something goes wrong. If you'd rather keep a log file instead of mail, redirect both streams:
+
+```cron
 0 0 * * * /home/yourusername/.local/bin/dotfiles auto-sync >> /home/yourusername/.dotfiles_sync.log 2>&1
 ```
 
 *(Note: If your SSH key requires a password/passphrase, you will need to look into exporting your `SSH_AUTH_SOCK` environment variable to cron so the background script can access your active SSH agent).*
+
+### Failure Notifications via Slack
+Instead of local mail, `auto-sync` can post failures to Slack using a webhook. When a webhook is configured and the message is delivered, nothing is written to cron's mail. If delivery fails, the error falls back to stderr (and therefore cron's local mail), so failures are never lost.
+
+**1. Create a webhook** using either option:
+
+- **Workflow Builder** (usually allowed without admin approval): in Slack, open **Tools → Workflow Builder → New workflow → From a webhook**, add a variable named exactly `text` (type: text), add a **Send a message to a person** step targeting yourself with the `text` variable as the message, then publish and copy the URL (`https://hooks.slack.com/triggers/...`).
+- **Incoming Webhook app** (may require admin approval): at <https://api.slack.com/apps>, choose **Create New App → From scratch**, enable **Incoming Webhooks**, click **Add New Webhook**, pick a channel or your DM, and copy the URL (`https://hooks.slack.com/services/...`).
+
+**2. Store the URL** in a private file. Do not track it with `dotfiles add`, as anyone with the URL can post to your Slack:
+
+```bash
+mkdir -p ~/.config/dotfiles
+echo 'https://hooks.slack.com/...' > ~/.config/dotfiles/slack-webhook-url
+chmod 600 ~/.config/dotfiles/slack-webhook-url
+```
+
+Alternatively, set the `DOTFILES_SLACK_WEBHOOK` environment variable, which takes precedence over the file.
+
+**3. Verify the setup:**
+
+```bash
+dotfiles test-notify
+```
 
 ---
 
@@ -96,6 +129,7 @@ Append the following line (replace `yourusername` with your actual system userna
 | `dotfiles status` | Reviews modifications across your explicitly tracked files. |
 | `dotfiles commit "<msg>"`| Creates a local snapshot save-point (without pushing). |
 | `dotfiles push` | Syncs local configurations upstream to your remote branch. |
-| `dotfiles auto-sync` | Scans for file edits, snapshots, and updates your remote silently. |
+| `dotfiles auto-sync` | Scans for file edits, snapshots, and updates your remote silently. Reports only on failure. |
+| `dotfiles test-notify` | Sends a test notification to the configured Slack webhook. |
 | `dotfiles git <args...>` | Runs standard git commands inside your bare setup context (e.g., `dotfiles git log`). |
 
